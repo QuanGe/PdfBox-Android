@@ -290,6 +290,71 @@ public class COSParser extends BaseParser
         return trailer;
     }
 
+  
+    /**
+     * 校验 PDF 尾部的交叉引用表拓扑结构是否合法。
+     * 保持与 PdfBox 官方底层流探测逻辑高度一致，不进行额外的数字格式强校验。
+     * 
+     * @return true 代表 PDF 基础拓扑完好；false 代表已损坏。
+     * @throws IOException 读取流异常
+     */
+    public boolean isPdfValid() throws IOException {
+        // 1. 备份当前流的原始位置，确保方法执行完毕后完美还原，不污染外部解析器
+        long originalPosition = source.getPosition();
+        
+        try {
+            // 2. 获取 startxref 的偏移量
+            long startXRefOffset = getStartxrefOffset();
+            if (startXRefOffset <= -1) {
+                return false; // 连 startxref 标记都找不到，必然损坏
+            }
+
+            // 3. 防御性检查：确保偏移量没有超出文件总长度
+            if (startXRefOffset >= source.length()) {
+                return false;
+            }
+
+            // 4. 安全地解析偏移量对应的实际位置
+            // 使用局部变量承接，严禁赋值给全局变量 startXrefOffset，防止污染状态机
+            source.seek(startXRefOffset);
+            long actualXRefPos;
+            try {
+                actualXRefPos = Math.max(0, parseStartXref()); 
+            } catch (Exception e) {
+                // 如果在解析偏移量时就报错（如格式彻底错乱），直接判定损坏
+                return false; 
+            }
+
+            // 再次边界检查
+            if (actualXRefPos >= source.length() || actualXRefPos == 0) {
+                return false;
+            }
+
+            // 5. 跳转到实际 XRef 表或 XRef 流的位置进行验证
+            source.seek(actualXRefPos);
+            skipSpaces();
+
+            // 6. 严格同步 PdfBox 底层分支逻辑
+            // 情况 A: 传统的 XRef Table 形式 (以 'x' 也就是 xref 关键字开头)
+            if (source.peek() == 'x' && isString(XREF_TABLE)) {
+                return true; // 匹配到 "xref" 关键字，与官方行为一致，直接放行
+            } 
+            
+            // 情况 B: 现代 PDF 常见的 XRef Stream 形式
+            // 去掉 >= '0' 与 <= '9' 的前置拦截，完全交由 PdfBox 原生的 checkXRefStreamOffset 处理
+            if (checkXRefStreamOffset(actualXRefPos)) {
+                return true;
+            }
+
+            return false;
+        } finally {
+            // 7. 无论成功还是失败，必须将流指针恢复到最初位置，防止后续业务解析错位
+            try {
+                source.seek(originalPosition);
+            } catch (IOException ignored) {}
+        }
+    }
+
     /**
      * Parses cross reference tables.
      *
